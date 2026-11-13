@@ -35,7 +35,7 @@ index 0000000000000..1111111111111
 + * paced read() loop converts and copies in chunks.
 + *
 + *   fd = open("/dev/adc0", O_RDONLY);
-+ *   read(fd, buf, 1024);	/* 512 samples @ 16 kHz = 32 ms */
++ *   read(fd, buf, 1024);   (512 samples at 16 kHz = 32 ms)
 + *
 + * Sample format: signed 16-bit little-endian, nominal 16000 Hz,
 + * value = (raw12 - 2048) << 4.
@@ -237,7 +237,7 @@ index 0000000000000..1111111111111
 +	.open		= esp32adc_open,
 +	.release	= esp32adc_release,
 +	.read		= esp32adc_read,
-+	.llseek		= no_llseek,
++	.llseek		= noop_llseek,
 +};
 +
 +static struct miscdevice esp32adc_misc = {
