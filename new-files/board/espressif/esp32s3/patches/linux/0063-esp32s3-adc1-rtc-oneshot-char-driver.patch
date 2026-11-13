@@ -1,0 +1,309 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: paulneja <207793167+paulneja@users.noreply.github.com>
+Date: Wed, 12 Nov 2026 10:00:00 +0000
+Subject: [PATCH 63/63] esp32s3: adc1 rtc oneshot character driver
+
+Add a minimal character driver for the ESP32-S3 ADC1 RTC oneshot
+controller. /dev/adc0 streams paced s16 samples from ADC1 channel 3
+(GPIO4, MAX9814 microphone) at 16 kHz for the keyword spotting demo.
+---
+ drivers/soc/Makefile      |   1 +
+ drivers/soc/esp32s3_adc.c | 281 ++
+ 2 files changed, 282 insertions(+)
+ create mode 100644 drivers/soc/esp32s3_adc.c
+
+diff --git a/drivers/soc/Makefile b/drivers/soc/Makefile
+--- a/drivers/soc/Makefile
++++ b/drivers/soc/Makefile
+@@ -37,3 +37,4 @@
+ obj-y				+= versatile/
+ obj-y				+= vt8500/
+ obj-y				+= xilinx/
++obj-y				+= esp32s3_adc.o
+diff --git a/drivers/soc/esp32s3_adc.c b/drivers/soc/esp32s3_adc.c
+new file mode 100644
+index 0000000000000..1111111111111
+--- /dev/null
++++ b/drivers/soc/esp32s3_adc.c
+@@ -0,0 +1,281 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ESP32-S3 ADC1 minimal character driver
++ *
++ * Streams samples from ADC1 channel 3 (GPIO4, MAX9814 microphone
++ * input) through the RTC oneshot controller. No IIO, no DMA: a
++ * paced read() loop converts and copies in chunks.
++ *
++ *   fd = open("/dev/adc0", O_RDONLY);
++ *   read(fd, buf, 1024);	/* 512 samples @ 16 kHz = 32 ms */
++ *
++ * Sample format: signed 16-bit little-endian, nominal 16000 Hz,
++ * value = (raw12 - 2048) << 4.
++ *
++ * Register programming follows esp-idf v5.3 adc_ll.h
++ * (adc_ll_set_controller / adc_oneshot_ll_*), RTC controller only.
++ * SENS and SYSTEM base addresses are ESP32-S3 specific.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/bits.h>
++#include <linux/fs.h>
++#include <linux/miscdevice.h>
++#include <linux/uaccess.h>
++#include <linux/io.h>
++#include <linux/ktime.h>
++#include <linux/sched.h>
++#include <linux/mutex.h>
++#include <linux/errno.h>
++#include <linux/delay.h>
++
++#define ADC_SENS_BASE		0x60008800UL
++#define ADC_SYSTEM_BASE		0x600C0000UL
++#define ADC_REG_SIZE		0x1000UL
++
++/* SYSTEM block: clock/reset for the APB SARADC wrapper */
++#define SYS_PERIP_CLK_EN0	(ADC_SYSTEM_BASE + 0x18)
++#define SYS_PERIP_RST_EN0	(ADC_SYSTEM_BASE + 0x20)
++#define SYS_SARADC_CLK_EN	BIT(28)
++#define SYS_SARADC_RST		BIT(28)
++
++/* SENS block, offsets from the esp32s3 sens_dev_s layout */
++#define SENS_READER1_CTRL	(ADC_SENS_BASE + 0x00)	/* sar1_clk_div:7:0 */
++#define SENS_MEAS1_CTRL2	(ADC_SENS_BASE + 0x0C)
++#define SENS_MEAS1_MUX		(ADC_SENS_BASE + 0x10)	/* sar1_dig_force:31 */
++#define SENS_ATTEN1		(ADC_SENS_BASE + 0x14)	/* 2 bits per channel */
++#define SENS_POWER_XPD		(ADC_SENS_BASE + 0x3C)
++#define SENS_SLAVE_ADDR1	(ADC_SENS_BASE + 0x40)	/* meas_status:29:22 */
++
++#define M1_DATA			GENMASK(15, 0)
++#define M1_DONE			BIT(16)
++#define M1_START		BIT(17)
++#define M1_START_FORCE		BIT(18)
++#define M1_EN_PAD		GENMASK(30, 19)
++#define M1_EN_PAD_FORCE		BIT(31)
++#define M1_DIG_FORCE		BIT(31)
++
++#define ADC_CHANNEL		3	/* GPIO4 = ADC1_CH3 */
++#define ADC_ATTEN		3	/* 11 dB */
++#define ADC_RATE_HZ		16000
++#define ADC_CHUNK		64	/* samples per copy_to_user() */
++#define ADC_TIMEOUT_NS		10000000LL	/* 10 ms per conversion step */
++
++static void __iomem *adc_sens;
++static void __iomem *adc_system;
++
++static DEFINE_MUTEX(adc_open_lock);
++static bool adc_in_use;
++
++static u16 adc_chunk[ADC_CHUNK];
++
++static inline u32 adc_readl(unsigned long addr)
++{
++	return readl((void __iomem *)addr);
++}
++
++static inline void adc_writel(unsigned long addr, u32 val)
++{
++	writel(val, (void __iomem *)addr);
++}
++
++/* Read-modify-write a 32-bit MMIO register. */
++static inline u32 adc_rmw(unsigned long addr, u32 mask, u32 val)
++{
++	u32 old = adc_readl(addr);
++
++	adc_writel(addr, (old & ~mask) | val);
++	return old;
++}
++
++/* Wait until the RTC ADC controller reports idle (meas_status == 0). */
++static int adc_wait_idle(void)
++{
++	s64 deadline = ktime_get_ns() + ADC_TIMEOUT_NS;
++
++	while (((adc_readl(SENS_SLAVE_ADDR1) >> 22) & 0xFF) != 0) {
++		if (ktime_get_ns() > deadline)
++			return -ETIMEDOUT;
++	}
++	return 0;
++}
++
++/* One RTC oneshot conversion; raw 12-bit result in *raw. */
++static int adc_convert(u16 *raw)
++{
++	int ret;
++
++	ret = adc_wait_idle();
++	if (ret)
++		return ret;
++
++	adc_rmw(SENS_MEAS1_CTRL2, M1_START, 0);
++	adc_rmw(SENS_MEAS1_CTRL2, M1_START, M1_START);
++
++	{
++		s64 deadline = ktime_get_ns() + ADC_TIMEOUT_NS;
++
++		while (!(adc_readl(SENS_MEAS1_CTRL2) & M1_DONE)) {
++			if (ktime_get_ns() > deadline)
++				return -ETIMEDOUT;
++		}
++	}
++
++	*raw = adc_readl(SENS_MEAS1_CTRL2) & M1_DATA;
++	return 0;
++}
++
++static int esp32adc_open(struct inode *inode, struct file *file)
++{
++	int ret = 0;
++
++	mutex_lock(&adc_open_lock);
++	if (adc_in_use)
++		ret = -EBUSY;
++	else
++		adc_in_use = true;
++	mutex_unlock(&adc_open_lock);
++	return ret;
++}
++
++static int esp32adc_release(struct inode *inode, struct file *file)
++{
++	mutex_lock(&adc_open_lock);
++	adc_in_use = false;
++	mutex_unlock(&adc_open_lock);
++	return 0;
++}
++
++/*
++ * Read paced samples. Each sample waits for its absolute time slot
++ * (1/ADC_RATE_HZ apart), converts, then is copied out in chunks.
++ * The read blocks for count / 2 / ADC_RATE_HZ seconds.
++ */
++static ssize_t esp32adc_read(struct file *file, char __user *buf,
++			     size_t count, loff_t *ppos)
++{
++	const s64 slot_ns = NSEC_PER_SEC / ADC_RATE_HZ;
++	s64 next = ktime_get_ns() + slot_ns;
++	size_t done = 0;
++	int i, n;
++
++	if (count & 1)
++		count--;
++
++	while (done < count) {
++		n = min_t(size_t, ADC_CHUNK, (count - done) / 2);
++
++		for (i = 0; i < n; i++) {
++			s64 now, rem;
++			u16 raw;
++			s16 sample;
++			int ret;
++
++			/* Pace to the absolute slot schedule. */
++			while ((now = ktime_get_ns()) < next) {
++				rem = next - now;
++				if (rem > 2000)
++					cond_resched();
++			}
++			/* If we stalled far behind, resync instead of bursting. */
++			if (now > next + 10 * slot_ns)
++				next = now;
++			next += slot_ns;
++
++			ret = adc_convert(&raw);
++			if (ret) {
++				if (done)
++					return done;
++				return ret;
++			}
++
++			sample = ((s16)raw - 2048) << 4;
++			adc_chunk[i] = (u16)sample;
++		}
++
++		if (copy_to_user(buf + done, adc_chunk, n * 2)) {
++			if (done)
++				return done;
++			return -EFAULT;
++		}
++		done += n * 2;
++	}
++	return done;
++}
++
++static const struct file_operations esp32adc_fops = {
++	.owner		= THIS_MODULE,
++	.open		= esp32adc_open,
++	.release	= esp32adc_release,
++	.read		= esp32adc_read,
++	.llseek		= no_llseek,
++};
++
++static struct miscdevice esp32adc_misc = {
++	.minor		= MISC_DYNAMIC_MINOR,
++	.name		= "adc0",
++	.fops		= &esp32adc_fops,
++};
++
++static int __init esp32adc_init(void)
++{
++	int ret;
++
++	adc_sens = ioremap(ADC_SENS_BASE, ADC_REG_SIZE);
++	adc_system = ioremap(ADC_SYSTEM_BASE, ADC_REG_SIZE);
++	if (!adc_sens || !adc_system) {
++		ret = -ENOMEM;
++		goto err_unmap;
++	}
++
++	/* Gate and reset the APB SARADC wrapper (as IDF periph_module). */
++	adc_rmw(SYS_PERIP_CLK_EN0, SYS_SARADC_CLK_EN, SYS_SARADC_CLK_EN);
++	adc_rmw(SYS_PERIP_RST_EN0, SYS_SARADC_RST, SYS_SARADC_RST);
++	udelay(10);
++	adc_rmw(SYS_PERIP_RST_EN0, SYS_SARADC_RST, 0);
++
++	/* RTC controller, software-triggered start and pad bitmap. */
++	adc_rmw(SENS_MEAS1_MUX, M1_DIG_FORCE, 0);
++	adc_rmw(SENS_MEAS1_CTRL2, M1_START_FORCE | M1_EN_PAD_FORCE,
++		 M1_START_FORCE | M1_EN_PAD_FORCE);
++
++	/* Attenuation for channel 3: 2 bits at (channel * 2). */
++	adc_rmw(SENS_ATTEN1, 0x3 << (ADC_CHANNEL * 2),
++		ADC_ATTEN << (ADC_CHANNEL * 2));
++
++	/* Single enabled pad: ADC1 channel 3. */
++	adc_rmw(SENS_MEAS1_CTRL2, M1_EN_PAD,
++		 (1 << ADC_CHANNEL) << 19);
++
++	/* RTC clock divider (works as divide-by-N or N+1). */
++	adc_rmw(SENS_READER1_CTRL, 0xFF, 1);
++
++	ret = misc_register(&esp32adc_misc);
++	if (ret)
++		goto err_unmap;
++
++	pr_info("esp32adc: ADC1_CH3 (GPIO4) at %d Hz, s16 raw12<<4\n",
++		ADC_RATE_HZ);
++	return 0;
++
++err_unmap:
++	if (adc_sens)
++		iounmap(adc_sens);
++	if (adc_system)
++		iounmap(adc_system);
++	return ret;
++}
++
++static void __exit esp32adc_exit(void)
++{
++	misc_deregister(&esp32adc_misc);
++	iounmap(adc_sens);
++	iounmap(adc_system);
++}
++
++module_init(esp32adc_init);
++module_exit(esp32adc_exit);
++
++MODULE_DESCRIPTION("ESP32-S3 ADC1 RTC oneshot character driver");
++MODULE_LICENSE("GPL");
